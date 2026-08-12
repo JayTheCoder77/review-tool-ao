@@ -1,0 +1,10 @@
+# SQLite data layer artifacts
+db/*.db
+db/*.db-shm
+db/*.db-wal
+
+# Node
+node_modules/
+
+# Logs
+*.log
