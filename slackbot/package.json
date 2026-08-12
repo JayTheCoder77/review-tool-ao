@@ -1,0 +1,28 @@
+{
+  "name": "swarmreview-slackbot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SwarmReview component 3 — digest builder + Slack bot (Bolt) with a Slack-free local demo path.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "start": "node src/bot.ts",
+    "demo": "node src/demo.ts",
+    "demo:seed": "node src/demo.ts seed",
+    "demo:digest": "node src/demo.ts digest",
+    "demo:serve": "node src/demo.ts serve",
+    "demo:review": "node src/demo.ts review"
+  },
+  "dependencies": {
+    "@slack/bolt": "^3.22.0",
+    "@slack/types": "^2.22.0",
+    "@slack/web-api": "^6.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "^5.9.3"
+  }
+}
