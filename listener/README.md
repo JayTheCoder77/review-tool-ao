@@ -71,3 +71,83 @@ The daemon serves a REST API under `/api/v1`. The relevant routes (confirmed liv
 Concurrency guard: keep at most one poll cycle per session in flight; use the `change_log`,
 or just compare the previous file-status hash for each session — no daemon-side revision
 counter exists.
+
+---
+
+## Implementation (`listener/`)
+
+| File | Purpose |
+|---|---|
+| `hunks.js` | Pure hunk logic: split a unified diff into hunk blocks, stable hunk ids (`sha256(sessionId\|filePath\|diffText)`), one-line summaries, binary diff detection. |
+| `index.js` | The Listener service: polls `GET /api/v1/sessions` (workers only) every ~10s, subscribes to `GET /api/v1/events` (SSE) as an accelerator, fetches changed files + per-file diffs, splits into hunks, dedupes in-memory, and `POST /hunks` to the Data Layer. |
+| `demo.js` | Self-test/demo: simulates an AO session (temp git worktree with edits incl. a binary file) through the same pipeline, then runs one live poll against the real AO daemon, and verifies via `GET /hunks`. |
+
+### How the Listener works
+
+1. **Poll** `GET /api/v1/sessions` every `POLL_INTERVAL_MS` (default 10s); filter `kind === "worker"`.
+   Also subscribes to `GET /api/v1/events` (SSE) so any daemon event can trigger an immediate
+   poll; the timer remains the source of truth.
+2. Per worker session, **`GET /api/v1/sessions/{id}/workspace/files`** → changed files
+   (status ≠ `unmodified`). Binary files are skipped (daemon `binary` flag + NUL-byte check).
+3. Per changed file, **`GET /api/v1/sessions/{id}/workspace/file?path=<rel>`** → `diff` field
+   (full unified git diff). Split into hunks with `hunks.js`.
+4. Each hunk → `{ id: sha256(sessionId|filePath|diffText), sessionId, agentName, filePath,
+   diffText, summary }` (summary = first added line, else the `@@` header). `agentName` is the
+   session's `displayName`/`harness`.
+5. **`POST /hunks`** to the Data Layer with the client-supplied stable `id`. The Data Layer is
+   **idempotent by id** — re-posting the same hunk returns `200` with the existing row instead
+   of `201` (verified live). The Listener also tracks posted hunk ids in-memory so an unchanged
+   hunk is not even re-POSTed on every poll (`skipped` in cycle stats).
+6. **Never talks to Slack, never steers AO sessions.** The only write it does is `POST /hunks`
+   to the Data Layer.
+
+Concurrency: at most one poll cycle is in flight at a time (a `running` guard); a slow cycle is
+not overlapped by the next timer tick.
+
+### Run
+
+```bash
+# 1) Data Layer (separate terminal; already running on :4821 in the demo env)
+cd ../db && node server.js
+
+# 2a) Listener — continuous watch (Ctrl-C to stop)
+cd ../listener && node index.js
+
+# 2b) One-shot cycle (useful for cron / verification)
+node index.js --once
+
+# 3) Demo / self-test — simulated session + one live poll
+cd ../listener && node demo.js
+# or only simulation / only live:
+node demo.js --simulate
+node demo.js --live
+```
+
+Verify in the Data Layer:
+
+```bash
+curl -s http://127.0.0.1:4821/hunks | python3 -m json.tool     # all hunks
+curl -s http://127.0.0.1:4821/hunks?status=pending | python3 -m json.tool
+curl -s http://127.0.0.1:4821/stats | python3 -m json.tool    # aggregates per agent
+```
+
+### Env vars
+
+| Var | Default | Meaning |
+|---|---|---|
+| `AO_API_URL` | `http://127.0.0.1:3001` | AO daemon base URL |
+| `DATA_LAYER_URL` | `http://127.0.0.1:4821` | SwarmReview Data Layer base URL |
+| `POLL_INTERVAL_MS` | `10000` | poll period |
+| `ONLY_SESSIONS` | (all) | comma-separated session ids to restrict to |
+| `USE_SSE` | `1` | set `0` to disable the SSE subscription |
+| `ONCE` / `--once` | off | run a single poll cycle then exit |
+
+### Known gaps / notes
+
+- Hunk granularity is "one `@@` section per hunk"; an agent edit spanning several hunks of one
+  file yields several pending hunks for the same file (grouped by the same session/file).
+- The listener computes hunks from the daemon's workspace diff per poll; there is no daemon-side
+  revision counter, so an unchanged file is detected via the stable content hash + in-memory
+  dedupe (and the Data Layer's idempotent `POST /hunks` as a backstop).
+- `diffText` in each hunk is a self-contained unified patch (`--- a/...` + `+++ b/...` + one
+  `@@` block) so the Router can `git apply` a single hunk without re-assembling file headers.
