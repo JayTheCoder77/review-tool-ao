@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SwarmReview &mdash; Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1420;
+    --panel: #171e2e;
+    --border: #26304a;
+    --text: #e6ebf5;
+    --muted: #8b95ad;
+    --pending: #f5a623;
+    --approved: #2ecc71;
+    --rejected: #e74c3c;
+    --revise: #5b9cf5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 18px;
+  }
+  h1 { font-size: 20px; margin: 0; }
+  .meta { color: var(--muted); font-size: 12px; }
+  .dot {
+    display: inline-block;
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--muted);
+  }
+  .dot.ok { background: var(--approved); }
+  .dot.err { background: var(--rejected); }
+  button {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 12px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+  }
+  button:hover { border-color: var(--muted); }
+  #banner {
+    display: none;
+    background: rgba(231, 76, 60, 0.12);
+    border: 1px solid var(--rejected);
+    color: #ffb3ab;
+    padding: 8px 12px;
+    border-radius: 6px;
+    margin-bottom: 16px;
+    font-size: 13px;
+  }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 10px;
+    margin-bottom: 20px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+  }
+  .card .num { font-size: 24px; font-weight: 700; }
+  .card .lbl { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .card .num.pending { color: var(--pending); }
+  .card .num.approved { color: var(--approved); }
+  .card .num.rejected { color: var(--rejected); }
+  .card .num.revise { color: var(--revise); }
+  h2 { font-size: 15px; margin: 24px 0 8px; color: var(--text); }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  th, td {
+    text-align: left;
+    padding: 7px 12px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+  tr:last-child td { border-bottom: none; }
+  td.num, th.num { text-align: right; }
+  .pill {
+    display: inline-block;
+    min-width: 30px;
+    text-align: center;
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .pill.pending { background: rgba(245,166,35,0.18); color: var(--pending); }
+  .pill.approved { background: rgba(46,204,113,0.18); color: var(--approved); }
+  .pill.rejected { background: rgba(231,76,60,0.18); color: var(--rejected); }
+  .pill.revise { background: rgba(91,156,245,0.18); color: var(--revise); }
+  .muted { color: var(--muted); }
+  .empty { color: var(--muted); padding: 12px; }
+  footer { margin-top: 20px; color: var(--muted); font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>&#128037; SwarmReview &mdash; Dashboard</h1>
+  <span class="meta">data layer: <span id="apiUrl"></span></span>
+  <span class="meta"><span id="connDot" class="dot"></span> <span id="connText">connecting&hellip;</span></span>
+  <span class="meta" id="refreshInfo"></span>
+  <button id="refreshBtn" type="button">Refresh now</button>
+</header>
+
+<div id="banner"></div>
+
+<section id="cards" class="cards"></section>
+
+<h2>Per agent</h2>
+<div id="agentWrap"><table id="agentTable"></table></div>
+
+<h2>Per session</h2>
+<div id="sessionWrap"><table id="sessionTable"></table></div>
+
+<footer>
+  Read-only status board. Pulls <code>GET /stats</code> + <code>GET /sessions</code> every 5&nbsp;s.
+  Serve with <code>python3 -m http.server 4822</code> from <code>dashboard/</code>.
+</footer>
+
+<script>
+"use strict";
+
+const API = "http://127.0.0.1:4821";
+const REFRESH_MS = 5000;
+
+const $ = (id) => document.getElementById(id);
+const STATUSES = ["pending", "approved", "rejected", "needs_revision"];
+const STATUS_LABEL = { pending: "pending", approved: "approved", rejected: "rejected", needs_revision: "needs_revision" };
+
+const els = {
+  apiUrl: $("apiUrl"), connDot: $("connDot"), connText: $("connText"),
+  refreshInfo: $("refreshInfo"), banner: $("banner"),
+  cards: $("cards"), agentTable: $("agentTable"), sessionTable: $("sessionTable"),
+};
+
+els.apiUrl.textContent = API;
+$("refreshBtn").addEventListener("click", load);
+
+let lastStats = null;
+let lastSessions = [];
+let loading = false;
+
+async function fetchJson(path) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 4000);
+  try {
+    const res = await fetch(API + path, { signal: ctl.signal, cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+function setConn(ok, msg) {
+  els.connDot.className = "dot " + (ok ? "ok" : "err");
+  els.connText.textContent = msg;
+}
+
+function showBanner(msg) {
+  els.banner.style.display = msg ? "block" : "none";
+  els.banner.textContent = msg || "";
+}
+
+function pill(status, count) {
+  return `<span class="pill ${status}">${count}</span>`;
+}
+
+function renderCards(s) {
+  const defs = [
+    ["Total hunks", s.totalHunks, ""],
+    ["Pending", s.pending, "pending"],
+    ["Approved", s.approved, "approved"],
+    ["Rejected", s.rejected, "rejected"],
+    ["Needs revision", s.needsRevision, "revise"],
+  ];
+  els.cards.innerHTML = defs.map(([lbl, num, cls]) =>
+    `<div class="card"><div class="num ${cls}">${num}</div><div class="lbl">${esc(lbl)}</div></div>`
+  ).join("");
+}
+
+function renderAgentTable(rows) {
+  if (!rows.length) {
+    els.agentTable.innerHTML = `<tr><td class="empty">No hunks yet.</td></tr>`;
+    return;
+  }
+  const head = `<tr><th>Agent</th><th class="num">Pending</th><th class="num">Approved</th><th class="num">Rejected</th><th class="num">Needs revision</th><th class="num">Total</th></tr>`;
+  const body = rows.map((r) => {
+    const total = r.pending + r.approved + r.rejected + r.needsRevision;
+    return `<tr>
+      <td>${esc(r.agentName || "?")}</td>
+      <td class="num">${pill("pending", r.pending)}</td>
+      <td class="num">${pill("approved", r.approved)}</td>
+      <td class="num">${pill("rejected", r.rejected)}</td>
+      <td class="num">${pill("revise", r.needsRevision)}</td>
+      <td class="num">${total}</td>
+    </tr>`;
+  }).join("");
+  els.agentTable.innerHTML = head + body;
+}
+
+function renderSessionTable(rows) {
+  if (!rows.length) {
+    els.sessionTable.innerHTML = `<tr><td class="empty">No sessions yet.</td></tr>`;
+    return;
+  }
+  const sessionsById = new Map(lastSessions.map((s) => [s.id, s]));
+  const head = `<tr><th>Session</th><th>Agent</th><th>Branch</th><th class="num">Pending</th><th class="num">Approved</th><th class="num">Rejected</th><th class="num">Needs revision</th><th class="num">Total</th><th>Last updated</th></tr>`;
+  const body = rows.map((r) => {
+    const meta = sessionsById.get(r.sessionId);
+    const total = r.pending + r.approved + r.rejected + r.needsRevision;
+    return `<tr>
+      <td>${esc(r.sessionId)}</td>
+      <td>${esc(meta ? meta.agentName : "-")}</td>
+      <td class="muted">${esc(meta && meta.branch ? meta.branch : "-")}</td>
+      <td class="num">${pill("pending", r.pending)}</td>
+      <td class="num">${pill("approved", r.approved)}</td>
+      <td class="num">${pill("rejected", r.rejected)}</td>
+      <td class="num">${pill("revise", r.needsRevision)}</td>
+      <td class="num">${total}</td>
+      <td class="muted">${esc(meta && meta.lastUpdatedAt ? new Date(meta.lastUpdatedAt).toLocaleString() : "-")}</td>
+    </tr>`;
+  }).join("");
+  els.sessionTable.innerHTML = head + body;
+}
+
+async function load() {
+  if (loading) return; // skip if a refresh is still in flight
+  loading = true;
+  try {
+    const [stats, sessions] = await Promise.all([fetchJson("/stats"), fetchJson("/sessions")]);
+    lastStats = stats;
+    lastSessions = sessions.sessions || [];
+    renderCards(stats);
+    renderAgentTable(stats.byAgent || []);
+    renderSessionTable(stats.bySession || []);
+    setConn(true, "connected");
+    showBanner("");
+  } catch (e) {
+    setConn(false, "Data Layer unreachable");
+    showBanner("Cannot reach Data Layer at " + API + " (" + e + "). Start it with `cd db && node server.js`, then refresh.");
+  } finally {
+    loading = false;
+  }
+}
+
+// Countdown so the demo shows the auto-refresh cycle.
+let lastTick = Date.now();
+setInterval(() => {
+  const until = REFRESH_MS - (Date.now() - lastTick);
+  els.refreshInfo.textContent = "auto-refresh in " + Math.max(0, Math.ceil(until / 1000)) + "s";
+  if (until <= 0) {
+    lastTick = Date.now();
+    load();
+  }
+}, 250);
+
+load();
+</script>
+</body>
+</html>
