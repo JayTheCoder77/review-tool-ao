@@ -137,7 +137,12 @@ function readBody(req) {
 
 function json(res, code, body) {
   const payload = JSON.stringify(body);
-  res.writeHead(code, { "Content-Type": "application/json; charset=utf-8" });
+  res.writeHead(code, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+  });
   res.end(payload);
 }
 
@@ -301,6 +306,7 @@ function events(req, res) {
     "Cache-Control": "no-cache",
     Connection: "keep-alive",
     "X-Accel-Buffering": "no",
+    "Access-Control-Allow-Origin": "*",
   });
   res.write("retry: 3000\n\n");
   sseClients.add(res);
@@ -325,6 +331,7 @@ const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, "http://x");
   const p = u.pathname;
   try {
+    if (req.method === "OPTIONS") return json(res, 204, {});
     if (req.method === "GET" && p === "/healthz") return json(res, 200, { ok: true });
     if (req.method === "GET" && p === "/events") return events(req, res);
     if (req.method === "POST" && p === "/hunks") return await postHunks(req, res);
