@@ -92,3 +92,125 @@ The Router resolves `hunkId` → hunk record (Data Layer `GET /hunks/:id`) to ge
 - The Router should subscribe to the Data Layer's decision feed (see `../db/schema.md`) rather
   than poll: the Data Layer exposes an SSE/streaming endpoint for new `decisions` rows.
 - **The Router only ever talks to AO (daemon API + git) and the Data Layer API — never Slack.**
+
+---
+
+# Implementation (`router/` — component 4)
+
+Zero-dependency Node (Node ≥ 22, built-ins only: `node:http`, `node:child_process`,
+`node:fs`, global `fetch`). The Router talks **only** to the Data Layer API, the AO daemon
+API, and git on session worktrees. It never talks to Slack.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `router.js` | Main loop: SSE subscription + poll fallback + dedupe + state persistence. |
+| `demo.js` | Self-test / live demo (see below). |
+| `lib/processor.js` | Decision orchestration: resolve hunk → worktree → dispatch approve/reject/revise. |
+| `lib/datalayer.js` | Data Layer client (`GET /hunks/:id`, `GET /decisions`, `GET /events` SSE). |
+| `lib/ao.js` | AO daemon client (`GET /api/v1/sessions`, `GET /api/v1/projects`, `POST /api/v1/sessions/{id}/send`). |
+| `lib/worktree.js` | Session → worktree resolution (`~/.ao/data/worktrees/<projectId>/<sessionId>/` + overrides). |
+| `lib/git.js` | `git apply --cached` / `git commit` / `git apply -R` helpers (never amend / force-push / `reset --hard`). |
+| `lib/sse.js` | Minimal SSE consumer (node:http). |
+| `lib/http.js` | Tiny JSON GET/POST helpers (global fetch). |
+| `.router-state.json` | Runtime state (processed decision ids) — created on first run, gitignored. |
+
+## How a decision flows through the Router
+
+1. **Subscribe** — `GET /events?types=decision` (SSE, `event: decision`). As a fallback the
+   router also **polls `GET /decisions`** every `SWARMREVIEW_POLL_INTERVAL_MS` (15 s default)
+   and runs a catch-up poll at startup, so decisions made while the router was offline are
+   still handled. Every decision id is recorded in `.router-state.json` and deduped in memory,
+   so SSE replays and poll overlap never double-process a decision.
+2. **Resolve the hunk** — `GET /hunks/:hunkId` → `sessionId`, `filePath`, `diffText`.
+3. **Resolve the worktree** — session → `projectId` (`GET /api/v1/sessions`, else project
+   prefix-inference via `GET /api/v1/projects`) → `~/.ao/data/worktrees/<projectId>/<sessionId>/`.
+   (Demo/testing can override with a `sessionId → path` map, see env table.)
+4. **Dispatch** (all git ops run inside the session worktree, on the session branch):
+
+   | action | what the Router does |
+   |---|---|
+   | `approve` | `git apply --cached <hunk>.patch` (stages **only** this hunk; falls back to `--3way`), then `git commit -m "swarmreview: apply hunk <id> (approved)"` (only the hunk — commit is restricted to the hunk's path if other files are pre-staged; never amend, never force-push). Optionally notifies the agent via `POST /api/v1/sessions/{id}/send`. |
+   | `reject` | `git apply -R <hunk>.patch` reverse-applies the hunk off the working tree (falls back to `-R --3way`). If the file moved on afterwards and the reverse-apply conflicts, the Router messages the agent via `/send` telling it to discard that change itself. Never `reset --hard`. |
+   | `revise` | (default) reverse-applies the hunk first so the agent starts from a clean slate, then `POST /api/v1/sessions/{id}/send` with `Reviewer feedback: <comment>` + “please revise <filePath> and re-propose”. |
+
+   When an apply/commit fails (e.g. the agent already committed the change, or edited the file
+   further) the Router **steers the agent via `/send`** instead of silently leaving the hunk
+   un-applied, so no human decision is lost.
+
+## Run
+
+```bash
+node router.js
+```
+
+Default expectations: Data Layer on `http://127.0.0.1:4821`, AO daemon on
+`http://127.0.0.1:3001`. Run `node demo.js` first to confirm the pipeline works.
+
+### Env
+
+| Env | Default | Purpose |
+|---|---|---|
+| `SWARMREVIEW_DATA_URL` | `http://127.0.0.1:4821` | Data Layer base (or `SWARMREVIEW_PORT`). |
+| `AO_API_URL` | `http://127.0.0.1:3001` | AO daemon base (or `AO_PORT`). |
+| `SWARMREVIEW_STATE_FILE` | `./router/.router-state.json` | Processed-decision state file. |
+| `SWARMREVIEW_POLL_INTERVAL_MS` | `15000` | Poll fallback interval (`0` disables periodic polling; startup catch-up poll always runs). |
+| `SWARMREVIEW_SSE_RETRY_MS` | `3000` | SSE reconnect delay. |
+| `SWARMREVIEW_AO_WORKTREES_ROOT` | `~/.ao/data/worktrees` | Worktree base dir. |
+| `SWARMREVIEW_WORKTREE_OVERRIDES` | — | `"sessionId=/path/to/worktree;..."` (demo/testing). |
+| `SWARMREVIEW_ONCE` / `--once` | off | Poll once, process, exit (cron/CI). |
+| `SWARMREVIEW_DRY_RUN=1` | off | Log decisions; touch neither git nor the daemon. |
+| `SWARMREVIEW_QUIET=1` | off | Less chatter. |
+| `SWARMREVIEW_GIT_AUTHOR_NAME` / `_EMAIL` | `SwarmReview Router` / `router@swarmreview.local` | Identity used only when a worktree has no git identity configured. |
+
+## Self-test / demo
+
+```bash
+node demo.js          # 15 assertions across approve / reject / revise / SSE
+```
+
+`demo.js` spins up a scratch git worktree (a simulated AO session workspace), then walks the
+real end-to-end path against the live Data Layer API (`http://127.0.0.1:4821`; falls back to
+a scratch instance if it is down):
+
+1. **approve** — posts a hunk, posts an `approve` decision, and the Router processor stages it
+   (`git apply --cached`) and commits it; verified via the scratch repo's commit log, file
+   content, and clean working tree.
+2. **reject** — posts a second hunk + `reject` decision; verified the file is reverse-applied
+   (`git apply -R`) back to its prior content with no new commit.
+3. **revise** — posts a third hunk + `revise` decision with a comment; verified the hunk is
+   reverse-applied (clean slate) and the reviewer comment is handed to
+   `POST /api/v1/sessions/{id}/send` (the demo session id doesn't exist on the real daemon, so
+   the 404 is expected and reported).
+4. **SSE** — subscribes to `GET /events` before any decision is posted and asserts all three
+   decisions arrive on the `decision` event feed (proves the same subscription path
+   `router.js` uses).
+
+The demo uses `SWARMREVIEW_WORKTREE_OVERRIDES` (programmatic equivalents) so it never touches
+real AO sessions. Exit code is 0 only when all assertions pass.
+
+## Verified live
+
+- Approve/reject/revise flows pass end-to-end through `router.js` against the live Data Layer
+  with a scratch worktree (commit created / change reverted / agent messaged).
+- SSE `decision` events are received and deduped; processed ids persist across restarts
+  (restart reprocesses nothing).
+- Worktree resolution works against the live AO daemon: a real session resolves to
+  `~/.ao/data/worktrees/<projectId>/<sessionId>/`; unknown sessions are prefix-matched to a
+  project and reported clearly when the worktree is missing.
+
+## Known gaps / notes
+
+- The `/send` success path is exercised only up to the daemon boundary in the demo (demo
+  session ids don't exist on the daemon → expected 404). With a real AO worker session running,
+  the same code path injects the message (the daemon endpoint itself was verified live per the
+  research at the top of this file).
+- Multi-hunk diffs: `git apply` operates on the whole diffText of a hunk. If a listener ever
+  publishes a hunk whose diffText covers more than one file, approve commits all of those
+  files' staged lines (paths beyond `filePath` are committed explicitly; cross-file hunks are
+  not split here).
+- If an agent has staged unrelated changes in its worktree, approve commits only the hunk's
+  path (see `commitHunk`), keeping the agent's other staged work intact.
+- `revise` reverse-apply is best-effort: if it conflicts, the agent is still steered with the
+  comment (the hunk is not left half-applied).
