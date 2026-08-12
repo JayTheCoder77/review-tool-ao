@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SwarmReview — Pending Hunks Digest (demo)</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #1a1d21;
+    color: #e8e8e8;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; }
+  header h1 { font-size: 20px; margin: 0 0 4px; }
+  header .sub { color: #a8a8a8; font-size: 13px; margin-bottom: 12px; }
+  #status { font-size: 13px; color: #d3d3d3; background: #22262b; border: 1px solid #333a42;
+    border-radius: 8px; padding: 8px 12px; margin-bottom: 16px; }
+  .empty { color: #a8a8a8; text-align: center; padding: 32px 0; }
+  .session { margin-bottom: 20px; }
+  .session-head {
+    font-size: 14px; color: #dbe4ee; background: #262b31; border: 1px solid #3a424b;
+    border-radius: 8px 8px 0 0; padding: 10px 12px;
+  }
+  .session-head .muted { color: #a8a8a8; font-weight: normal; }
+  .hunk { background: #22262b; border: 1px solid #333a42; border-top: none; padding: 12px; }
+  .hunk:last-child { border-radius: 0 0 8px 8px; }
+  .hunk-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+  .hunk-title { min-width: 0; }
+  .hunk-title .summary { color: #c6c6c6; font-size: 13px; margin-top: 2px; word-break: break-word; }
+  .actions { display: flex; gap: 8px; flex-shrink: 0; }
+  button {
+    font-size: 13px; border-radius: 6px; padding: 6px 12px; border: 1px solid #3a424b;
+    background: #2e343c; color: #e8e8e8; cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: #39404a; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.approve { background: #1d4b3a; border-color: #2c7a5a; }
+  button.approve:hover:not(:disabled) { background: #245a45; }
+  button.reject { background: #5a2328; border-color: #8a3439; }
+  button.reject:hover:not(:disabled) { background: #6d2a30; }
+  .diff { margin-top: 10px; }
+  .diff summary { font-size: 12px; color: #9fb4c8; cursor: pointer; user-select: none; }
+  .diff pre {
+    margin: 8px 0 0; padding: 10px; border-radius: 6px; background: #1a1d21;
+    border: 1px solid #2e343c; overflow-x: auto; font-size: 12px; line-height: 1.5;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  dialog { border: 1px solid #3a424b; border-radius: 10px; background: #262b31; color: #e8e8e8;
+    width: min(480px, 90vw); padding: 16px; }
+  dialog::backdrop { background: rgba(0,0,0,0.6); }
+  dialog h2 { font-size: 15px; margin: 0 0 8px; }
+  dialog textarea { width: 100%; min-height: 90px; border-radius: 6px; border: 1px solid #3a424b;
+    background: #1a1d21; color: #e8e8e8; padding: 8px; font: inherit; }
+  dialog .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+  .banner { font-size: 12px; color: #c9a15a; margin-top: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>SwarmReview — Pending Hunks Digest</h1>
+    <div class="sub">Grouped per AO session, one hunk card per proposed change. Decisions are written to the Data Layer and the Router reacts to them.</div>
+  </header>
+  <div id="status">Loading…</div>
+  <div id="digest"></div>
+</main>
+
+<dialog id="comment-modal">
+  <h2>Request revision</h2>
+  <textarea id="comment-text" placeholder="What should the agent change?"></textarea>
+  <div class="row">
+    <button id="comment-cancel">Cancel</button>
+    <button id="comment-send" class="approve">Send</button>
+  </div>
+</dialog>
+
+<script>
+"use strict";
+
+// The `demo digest` command injects these two globals before this script runs.
+const SNAPSHOT = window.__SNAPSHOT__ === true;
+const INITIAL_HUNKS = window.__INITIAL_HUNKS__ || null;
+const LIVE = !SNAPSHOT && !INITIAL_HUNKS;
+
+const $status = document.getElementById("status");
+const $digest = document.getElementById("digest");
+const $modal = document.getElementById("comment-modal");
+const $commentText = document.getElementById("comment-text");
+let pendingCommentHunk = null;
+
+function esc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function setStatus(text) {
+  $status.textContent = text;
+  if (SNAPSHOT) {
+    const banner = document.createElement("div");
+    banner.className = "banner";
+    banner.textContent = "Static snapshot: buttons are disabled. Run `npm run demo:serve` for a live digest with working buttons.";
+    $status.appendChild(banner);
+  }
+}
+
+async function load() {
+  let hunks;
+  if (SNAPSHOT || INITIAL_HUNKS) {
+    hunks = INITIAL_HUNKS || [];
+    setStatus(`Static snapshot — ${hunks.length} pending hunk(s) at render time`);
+  } else {
+    try {
+      const res = await fetch("/api/hunks?status=pending");
+      const body = await res.json();
+      if (!res.ok) throw new Error((body.error && body.error.message) || res.statusText);
+      hunks = (body.hunks || []).filter((h) => h.status === "pending");
+    } catch (e) {
+      setStatus("Failed to load hunks from the Data Layer: " + e);
+      $digest.innerHTML = "";
+      return;
+    }
+  }
+  render(hunks);
+}
+
+function render(hunks) {
+  const bySession = new Map();
+  for (const h of hunks) {
+    if (!bySession.has(h.sessionId)) bySession.set(h.sessionId, []);
+    bySession.get(h.sessionId).push(h);
+  }
+  const groups = [...bySession.entries()].map(([sessionId, hs]) => ({
+    sessionId,
+    agentName: hs[0].agentName,
+    hunks: hs,
+  }));
+
+  if (groups.length === 0) {
+    $digest.innerHTML = '<div class="empty">No pending hunks. Seed some: <code>npm run demo:seed</code></div>';
+    if (!SNAPSHOT) setStatus("0 pending hunks");
+    return;
+  }
+  if (!SNAPSHOT) {
+    const total = hunks.length;
+    setStatus(`${total} pending hunk(s) across ${groups.length} session(s)`);
+  }
+  $digest.innerHTML = groups.map((g) => `
+    <section class="session">
+      <div class="session-head"><strong>Session:</strong> ${esc(g.sessionId)}
+        <span class="muted">&mdash; ${esc(g.agentName)} &middot; ${g.hunks.length} pending</span></div>
+      ${g.hunks.map(hunkCard).join("")}
+    </section>`).join("");
+}
+
+function hunkCard(h) {
+  return `
+    <article class="hunk" data-hunk="${esc(h.id)}">
+      <div class="hunk-head">
+        <div class="hunk-title">
+          <strong>${esc(h.filePath)}</strong>
+          <div class="summary">${esc(h.summary || "(no summary)")}</div>
+        </div>
+        <div class="actions">
+          <button class="approve" data-action="approve" ${SNAPSHOT ? "disabled" : ""}>Approve</button>
+          <button class="reject" data-action="reject" ${SNAPSHOT ? "disabled" : ""}>Reject</button>
+          <button data-action="comment" ${SNAPSHOT ? "disabled" : ""}>Comment</button>
+        </div>
+      </div>
+      <details class="diff">
+        <summary>Show diff</summary>
+        <pre>${codeHtml(h.diffText)}</pre>
+      </details>
+    </article>`;
+}
+
+function codeHtml(text) {
+  return esc(text);
+}
+
+function hunkIdFrom(button) {
+  const article = button.closest(".hunk");
+  return article ? article.dataset.hunk : null;
+}
+
+async function postDecision(payload) {
+  try {
+    const res = await fetch("/api/decisions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      setStatus(`Decision failed: ${(body.error && body.error.message) || res.statusText}`);
+      return;
+    }
+    setStatus(`${payload.action} recorded for ${payload.hunkId} -> hunk status: ${body.hunk && body.hunk.status}`);
+    if (LIVE) await load();
+  } catch (e) {
+    setStatus("Decision failed: " + e);
+  }
+}
+
+async function decide(hunkId, action) {
+  const payload = { hunkId, action };
+  if (action === "reject") {
+    const c = window.prompt("Optional comment for the rejection (or leave empty):");
+    if (c !== null && c.trim()) payload.comment = c.trim();
+  }
+  await postDecision(payload);
+}
+
+function openComment(hunkId) {
+  pendingCommentHunk = hunkId;
+  $commentText.value = "";
+  $modal.showModal();
+  $commentText.focus();
+}
+
+async function submitComment() {
+  const text = $commentText.value.trim();
+  $modal.close();
+  if (!text) {
+    setStatus("A comment is required for revise (the Data Layer rejects empty comments).");
+    return;
+  }
+  await postDecision({ hunkId: pendingCommentHunk, action: "revise", comment: text });
+  pendingCommentHunk = null;
+}
+
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-action]");
+  if (!btn || SNAPSHOT) return;
+  const hunkId = hunkIdFrom(btn);
+  if (!hunkId) return;
+  const action = btn.dataset.action;
+  if (action === "comment") openComment(hunkId);
+  else decide(hunkId, action);
+});
+
+document.getElementById("comment-cancel").addEventListener("click", () => $modal.close());
+document.getElementById("comment-send").addEventListener("click", submitComment);
+
+if (LIVE) {
+  load();
+  setInterval(() => load(), 10000);
+} else {
+  load();
+}
+</script>
+</body>
+</html>
