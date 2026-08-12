@@ -1,0 +1,15 @@
+{
+  "name": "swarmreview-router",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SwarmReview Router (component 4): subscribes to human decisions from the Data Layer and applies them to AO session worktrees via git + AO daemon messaging.",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node router.js",
+    "demo": "node demo.js",
+    "once": "node router.js --once"
+  }
+}

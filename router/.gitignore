@@ -1,0 +1,2 @@
+# Router runtime state (processed decision ids — never commit)
+.router-state.json
